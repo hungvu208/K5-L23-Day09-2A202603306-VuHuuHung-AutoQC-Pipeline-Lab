@@ -40,5 +40,113 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    so = cfg["second_opinion"]
+    conf_thr = so["conf"]
+    min_area_px = so["min_area_px"]
+    fp_conf = so["fp_conf"]
+    iou_missing = so["iou_missing"]
+    iou_match = so["iou_match"]
+    iou_loose = so["iou_loose"]
+    num_classes = len(ds.classes)
+
+    issues = []
+    for p in ds.image_files():
+        stem = p.stem
+        if stem not in preds:
+            continue
+        raw_lines = ds.read_label_lines(stem)
+        if raw_lines is None:
+            continue
+        img_size = ds.image_size(stem)
+        if img_size is None:
+            continue
+        iw, ih = img_size
+
+        label_items = []
+        for line_no, text in raw_lines:
+            try:
+                cls_id, cx, cy, w, h = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= cls_id < num_classes:
+                label_items.append((line_no, cls_id, (cx, cy, w, h)))
+
+        img_preds = preds[stem]
+
+        for r in img_preds:
+            r_cls, r_conf, rx, ry, rw, rh = r
+            if r_conf < conf_thr:
+                continue
+            if (rw * iw) * (rh * ih) < min_area_px:
+                continue
+            r_box = (rx, ry, rw, rh)
+            cands = [
+                (l_cls, iou_xywh(r_box, l_box))
+                for _, l_cls, l_box in label_items
+            ]
+            cands = [(l_cls, iou) for l_cls, iou in cands if iou >= iou_missing]
+
+            if not cands:
+                issues.append(
+                    Issue(
+                        "second_opinion",
+                        WARN,
+                        "POSSIBLE_MISSING",
+                        stem,
+                        f"model thấy lớp {r_cls} (conf={r_conf:.2f}) nhưng không có box nhãn khớp",
+                        extra={"conf": r_conf, "class": r_cls},
+                    )
+                )
+            else:
+                same_ious = [iou for l_cls, iou in cands if l_cls == r_cls]
+                if same_ious:
+                    best_same = max(same_ious)
+                    if best_same < iou_loose:
+                        issues.append(
+                            Issue(
+                                "second_opinion",
+                                WARN,
+                                "POSSIBLE_LOOSE_BOX",
+                                stem,
+                                f"box nhãn cùng lớp {r_cls} nhưng lỏng (IoU={best_same:.2f} < {iou_loose})",
+                                extra={"conf": r_conf, "iou": best_same},
+                            )
+                        )
+                else:
+                    best_other = max(iou for _, iou in cands)
+                    if best_other >= iou_match:
+                        issues.append(
+                            Issue(
+                                "second_opinion",
+                                WARN,
+                                "POSSIBLE_WRONG_CLASS",
+                                stem,
+                                f"model dự đoán lớp {r_cls} (conf={r_conf:.2f}, IoU={best_other:.2f}) khác lớp nhãn",
+                                extra={"conf": r_conf, "iou": best_other},
+                            )
+                        )
+
+        fp_boxes = [
+            (px, py, pw, ph)
+            for _, p_conf, px, py, pw, ph in img_preds
+            if p_conf >= fp_conf
+        ]
+        for line_no, _, l_box in label_items:
+            best_iou = max((iou_xywh(l_box, p_box) for p_box in fp_boxes), default=0.0)
+            if best_iou < iou_missing:
+                issues.append(
+                    Issue(
+                        "second_opinion",
+                        WARN,
+                        "POSSIBLE_FALSE_POS",
+                        stem,
+                        f"nhãn dòng {line_no} không khớp dự đoán nào (max IoU={best_iou:.2f})",
+                        line=line_no,
+                        extra={"iou": best_iou},
+                    )
+                )
+
+    return issues
